@@ -132,7 +132,7 @@ confirmed, so a failed promotion cannot erase either provider's credentials.
 ## Verify before sending
 
 ```bash
-APP="src-tauri/target/release/bundle/macos/DJ Uploader.app"
+APP="src-tauri/target/universal-apple-darwin/release/bundle/macos/DJ Uploader.app"
 codesign -dv --verbose=4 "$APP"      # Authority → Developer ID Application: Mark Blake
 xcrun stapler validate "$APP"        # → "The validate action worked!"
 spctl -a -vvv "$APP"                 # → accepted, source=Notarized Developer ID

@@ -121,13 +121,15 @@ export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="…"   # if the key has a password
 ## Releasing
 
 ```bash
-./scripts/create-release.sh
+pnpm op:release
 ```
 
-This runs `pnpm tauri build`, then creates a **draft** GitHub release with the
-DMG, the updater `*.app.tar.gz` + `.sig`, and a generated `latest.json`. Publish
-with `gh release edit v<version> --draft=false` — `latest.json` must sit on the
-newest published release for the updater to find it.
+This runs `pnpm tauri build --target universal-apple-darwin`, then creates a
+**draft** GitHub release with the universal DMG, the updater `*.app.tar.gz` +
+`.sig`, and a generated `latest.json`. The manifest maps both
+`darwin-aarch64` and `darwin-x86_64` to the same signed universal archive.
+Publish with `gh release edit v<version> --draft=false` — `latest.json` must sit
+on the newest published release for the updater to find it.
 
 ## Icons
 

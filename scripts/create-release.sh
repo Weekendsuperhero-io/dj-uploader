@@ -7,6 +7,8 @@
 # Requirements:
 #   - gh CLI (brew install gh) + `gh auth login`
 #   - Node + pnpm, Rust toolchain
+#   - Both macOS Rust targets:
+#     `rustup target add aarch64-apple-darwin x86_64-apple-darwin`
 #   - For a signed/notarized DMG: APPLE_SIGNING_IDENTITY (codesign) +
 #     APPLE_API_ISSUER / APPLE_API_KEY / APPLE_API_KEY_PATH (notarization).
 #     Easiest via `pnpm op:release` — see scripts/README.md and BUILD.md
@@ -25,10 +27,12 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
-REPO="WeekendSuperhero/dj-uploader"
+REPO="Weekendsuperhero-io/dj-uploader"
 VERSION=$(grep -E '^version = ' "src-tauri/Cargo.toml" | head -1 | sed -E 's/version = "(.*)"/\1/')
 TAG="v${VERSION}"
-BUNDLE_DIR="src-tauri/target/release/bundle"
+BUILD_TARGET="universal-apple-darwin"
+TARGET_DIR="src-tauri/target/${BUILD_TARGET}/release"
+BUNDLE_DIR="${TARGET_DIR}/bundle"
 
 log_info "Preparing release for DJ Uploader ${VERSION} (${TAG})"
 
@@ -40,16 +44,26 @@ if git rev-parse "$TAG" >/dev/null 2>&1; then
 fi
 
 if [ "${SKIP_BUILD:-false}" != "true" ]; then
-    log_info "Building with 'pnpm tauri build' (this also builds the frontend)…"
+    command -v rustup >/dev/null 2>&1 || { log_error "rustup is required for a universal macOS build"; exit 1; }
+    INSTALLED_TARGETS=$(rustup target list --installed)
+    for target in aarch64-apple-darwin x86_64-apple-darwin; do
+        if ! grep -qx "$target" <<< "$INSTALLED_TARGETS"; then
+            log_error "Missing Rust target: $target"
+            log_error "Install both with: rustup target add aarch64-apple-darwin x86_64-apple-darwin"
+            exit 1
+        fi
+    done
+
+    log_info "Building universal macOS app with 'pnpm tauri build --target ${BUILD_TARGET}'…"
     if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
-        log_warn "TAURI_SIGNING_PRIVATE_KEY is not set — the updater artifacts will not be signed"
-        log_warn "and the in-app updater will reject them. Set it to the contents of the private key."
+        log_error "TAURI_SIGNING_PRIVATE_KEY is not set — updater artifacts cannot be signed."
+        exit 1
     fi
     pnpm install --frozen-lockfile
-    pnpm tauri build
+    pnpm tauri build --target "$BUILD_TARGET"
 fi
 
-# Locate build artifacts (arch-specific file names differ between Apple Silicon and Intel).
+# Locate the universal build artifacts.
 DMG_FILE=$(ls -t "$BUNDLE_DIR"/dmg/*.dmg 2>/dev/null | head -1 || true)
 APP_TAR=$(ls -t "$BUNDLE_DIR"/macos/*.app.tar.gz 2>/dev/null | head -1 || true)
 APP_SIG=$(ls -t "$BUNDLE_DIR"/macos/*.app.tar.gz.sig 2>/dev/null | head -1 || true)
@@ -58,7 +72,7 @@ APP_SIG=$(ls -t "$BUNDLE_DIR"/macos/*.app.tar.gz.sig 2>/dev/null | head -1 || tr
 log_success "DMG:     $DMG_FILE"
 
 # Stage assets under space-free names so GitHub download URLs are predictable.
-STAGE="src-tauri/target/release/release-assets"
+STAGE="${TARGET_DIR}/release-assets"
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 DMG_ASSET="DJ-Uploader-${VERSION}.dmg"
 cp "$DMG_FILE" "$STAGE/$DMG_ASSET"
@@ -70,12 +84,6 @@ if [ -n "$APP_TAR" ] && [ -n "$APP_SIG" ]; then
     cp "$APP_SIG" "$STAGE/${TAR_ASSET}.sig"
     ASSETS+=("$STAGE/$TAR_ASSET" "$STAGE/${TAR_ASSET}.sig")
 
-    # Map the current build arch to the Tauri updater platform key.
-    case "$(uname -m)" in
-        arm64|aarch64) PLATFORM_KEY="darwin-aarch64" ;;
-        x86_64) PLATFORM_KEY="darwin-x86_64" ;;
-        *) PLATFORM_KEY="darwin-$(uname -m)" ;;
-    esac
     SIG_CONTENT=$(cat "$APP_SIG")
     PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     cat > "$STAGE/latest.json" <<EOF
@@ -84,7 +92,11 @@ if [ -n "$APP_TAR" ] && [ -n "$APP_SIG" ]; then
   "notes": "See the release page for details.",
   "pub_date": "${PUB_DATE}",
   "platforms": {
-    "${PLATFORM_KEY}": {
+    "darwin-aarch64": {
+      "signature": "${SIG_CONTENT}",
+      "url": "https://github.com/${REPO}/releases/download/${TAG}/${TAR_ASSET}"
+    },
+    "darwin-x86_64": {
       "signature": "${SIG_CONTENT}",
       "url": "https://github.com/${REPO}/releases/download/${TAG}/${TAR_ASSET}"
     }
@@ -92,10 +104,11 @@ if [ -n "$APP_TAR" ] && [ -n "$APP_SIG" ]; then
 }
 EOF
     ASSETS+=("$STAGE/latest.json")
-    log_success "Updater: $TAR_ASSET (+ .sig, latest.json for $PLATFORM_KEY)"
+    log_success "Updater: $TAR_ASSET (+ .sig, latest.json for Apple Silicon and Intel)"
 else
-    log_warn "No updater artifacts found — the in-app updater will not have a feed for this release."
-    log_warn "Ensure bundle.createUpdaterArtifacts is enabled and TAURI_SIGNING_PRIVATE_KEY is set."
+    log_error "No signed universal updater artifacts found under $BUNDLE_DIR/macos."
+    log_error "Refusing to create a DMG-only release without a working updater feed."
+    exit 1
 fi
 
 RELEASE_NOTES=$(cat <<EOF
