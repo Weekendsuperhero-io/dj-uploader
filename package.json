@@ -1,7 +1,7 @@
 {
   "name": "dj-uploader",
   "private": true,
-  "version": "2026.6.1",
+  "version": "2026.7.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -44,5 +44,6 @@
     "tailwindcss": "^4.3.2",
     "typescript": "^7.0.2",
     "vite": "^8.1.4"
-  }
+  },
+  "packageManager": "pnpm@^11.11.0"
 }
