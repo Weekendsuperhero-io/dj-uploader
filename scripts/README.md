@@ -1,249 +1,148 @@
-# DJ Uploader - macOS Build Scripts
+# DJ Uploader — macOS build & release
 
-Scripts for building, signing, and packaging DJ Uploader for macOS distribution.
+DJ Uploader is a **Tauri v2** app: a React + Sistine frontend (repo root) over a
+Rust backend (`src-tauri/`). Tauri's bundler builds, signs, notarizes, and
+produces the `.app`, `.dmg`, and auto-updater artifacts — replacing the old
+hand-rolled `build-and-sign-macos.sh`.
 
-## Quick Start
-
-### Build Without Signing (Local Development)
-
-```bash
-./scripts/build-and-sign-macos.sh
-```
-
-Creates an unsigned app bundle and DMG. Perfect for local testing.
-
-### Build With Signing (For Distribution)
+## Quick start
 
 ```bash
-# First, get your certificate identity
-./scripts/cert-helper.sh list
-
-# Then build with signing
-export ENABLE_CODESIGN=true
-export CODESIGN_IDENTITY="Apple Development: Your Name (TEAMID)"
-./scripts/build-and-sign-macos.sh
+pnpm install          # frontend deps
+pnpm tauri dev        # run the app (hot-reloads the UI)
+pnpm tauri build      # produce a release .app + .dmg under src-tauri/target/release/bundle
 ```
 
-## Main Scripts
+Output:
 
-### `build-and-sign-macos.sh`
+- `.app`  → `src-tauri/target/release/bundle/macos/DJ Uploader.app`
+- `.dmg`  → `src-tauri/target/release/bundle/dmg/DJ Uploader_<version>_<arch>.dmg`
+- updater → `…/macos/DJ Uploader.app.tar.gz` (+ `.sig`) when `TAURI_SIGNING_PRIVATE_KEY` is set
 
-The primary build script that handles everything:
+App metadata (name, bundle id `com.djuploader.app`, category, min macOS, icons,
+file associations, updater feed) lives in **`src-tauri/tauri.conf.json`**. The
+version is read from `src-tauri/Cargo.toml`.
 
-1. Builds the Rust release binary
-2. Creates the macOS .app bundle
-3. Code signs the application (optional)
-4. Creates a DMG installer
-5. Notarizes with Apple (optional)
+## Secrets with 1Password
 
-**Basic usage:**
+All secrets are sourced from 1Password via the `op` CLI — nothing sensitive is
+committed or exported by hand. The pointers live in one committed file,
+**`.env.1password`** (repo root): it maps each build env var to an
+`op://vault/item/field` reference (no secrets). **That is the only file to edit** if
+your vault or item/field names differ from the defaults.
+
+The exact env-var → `op://` reference → 1Password item/field mapping (the three items
+`dj-uploader-apple`, `dj-uploader-updater`, `dj-uploader-api` and every field to fill)
+is in **[`BUILD.md`](../BUILD.md#secrets)**.
+
+One-time setup:
 
 ```bash
-./scripts/build-and-sign-macos.sh
+brew install 1password-cli            # if needed
+op signin
+./scripts/1password-seed.sh           # creates the items from your current local values
 ```
 
-**With code signing:**
+Then build/release with secrets injected (into the process env only, never disk):
 
 ```bash
-export ENABLE_CODESIGN=true
-export CODESIGN_IDENTITY="Apple Development: mark@weekendsuperhero.io (9NJ8MQVZUN)"
-./scripts/build-and-sign-macos.sh
+pnpm op:dev        # op run --env-file=.env.1password -- tauri dev
+pnpm op:build      # signed + notarized build
+pnpm op:release    # build + draft GitHub release
 ```
 
-**With notarization (requires Developer ID certificate):**
+Which secrets flow where:
+
+- **Apple signing/notarization** and the **updater private key** → env vars read by `tauri build`.
+- **Mixcloud/SoundCloud client id/secret** → `DJ_*` env vars read by `build.rs`, which
+  encrypts them into the binary. `build.rs` falls back to a local git-ignored
+  `config.json`, then to placeholders — so **CI builds without any secrets**, and
+  `config.json` is no longer committed.
+
+For CI that must produce signed releases, use a
+[1Password service account](https://developer.1password.com/docs/service-accounts/)
+(`OP_SERVICE_ACCOUNT_TOKEN` as a repo secret) with the same `op run` command, or
+map the values to GitHub Actions secrets.
+
+## Code signing & notarization
+
+Tauri reads these environment variables at `tauri build` time:
+
+| Variable                     | Purpose                                                          |
+| ---------------------------- | --------------------------------------------------------------- |
+| `APPLE_SIGNING_IDENTITY`     | Certificate name, e.g. `Developer ID Application: … (TEAMID)`    |
+| `APPLE_CERTIFICATE`          | Base64 `.p12` (CI only; alternative to a keychain identity)      |
+| `APPLE_CERTIFICATE_PASSWORD` | Password for the `.p12` above                                   |
+| `APPLE_API_ISSUER`           | App Store Connect Issuer ID (notarization)                      |
+| `APPLE_API_KEY`              | App Store Connect Key ID (notarization)                         |
+| `APPLE_API_KEY_PATH`         | Path to the `AuthKey_<KeyID>.p8` file (notarization)            |
+
+Codesigning uses the Developer ID certificate; notarization uses an **App Store
+Connect API key** (Issuer ID + Key ID + `.p8`). The Apple-ID + app-specific-password
+method also works (`APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID`) but the API key is
+preferred. Example (signed + notarized):
 
 ```bash
-export ENABLE_CODESIGN=true
-export ENABLE_NOTARIZE=true
-export CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
-export APPLE_ID="your@apple.id"
-export APPLE_TEAM_ID="TEAMID"
-./scripts/build-and-sign-macos.sh
+export APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+export APPLE_API_ISSUER="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+export APPLE_API_KEY="XXXXXXXXXX"
+export APPLE_API_KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_XXXXXXXXXX.p8"
+pnpm tauri build
 ```
 
-### `cert-helper.sh`
+With 1Password, `pnpm op:build` handles all of this — `scripts/with-appstore-key.sh`
+pulls the `.p8` from your vault into a temp file and deletes it after the build.
 
-All-in-one tool for managing code signing certificates.
+Hardened-runtime entitlements are in `src-tauri/entitlements.plist` (network
+client/server for the OAuth loopback, user-selected file read/write, JIT).
 
-**Commands:**
+Use `./scripts/cert-helper.sh {list,setup,troubleshoot,fix}` to inspect or repair
+signing certificates (installs Apple WWDR intermediates when needed).
+
+## Auto-updater
+
+The in-app updater (`@tauri-apps/plugin-updater`) checks the **latest GitHub
+release** for `latest.json` (endpoint configured in `tauri.conf.json`).
+
+Signing keypair (generated once, kept OUT of the repo):
 
 ```bash
-# List available certificates
-./scripts/cert-helper.sh list
-
-# Get setup instructions
-./scripts/cert-helper.sh setup
-
-# Diagnose certificate issues
-./scripts/cert-helper.sh troubleshoot
-
-# Fix certificate trust issues
-./scripts/cert-helper.sh fix
+cargo tauri signer generate -w ~/.tauri/dj-uploader-updater.key
+# → put the PUBLIC key in tauri.conf.json > plugins.updater.pubkey
 ```
 
-### `make_icons.sh`
-
-Generates macOS .icns icon files from source images.
-
-## Environment Variables
-
-| Variable            | Required      | Default              | Description                                       |
-| ------------------- | ------------- | -------------------- | ------------------------------------------------- |
-| `ENABLE_CODESIGN`   | No            | `false`              | Enable code signing                               |
-| `CODESIGN_IDENTITY` | If signing    | -                    | Certificate name (e.g., "Apple Development: ...") |
-| `ENABLE_NOTARIZE`   | No            | `false`              | Enable notarization (requires Developer ID)       |
-| `APPLE_ID`          | If notarizing | -                    | Your Apple ID email                               |
-| `APPLE_TEAM_ID`     | If notarizing | -                    | Your Apple Developer Team ID                      |
-| `NOTARY_PROFILE`    | No            | `notarytool-profile` | Keychain profile for notarization credentials     |
-
-## Code Signing Certificates
-
-### Development Certificate (Free)
-
-**Best for:** Local development and testing
-
-- **Cost:** Free with Apple ID
-- **Notarization:** Not supported
-- **Distribution:** Works locally, may show warnings when shared
-
-**How to get:**
-
-1. Open Xcode
-2. Xcode → Preferences → Accounts
-3. Add your Apple ID
-4. Manage Certificates → + → Apple Development
-
-### Developer ID Certificate ($99/year)
-
-**Best for:** Public distribution outside Mac App Store
-
-- **Cost:** $99/year (Apple Developer Program)
-- **Notarization:** Fully supported
-- **Distribution:** No warnings for users
-
-**How to get:**
-
-1. Join [Apple Developer Program](https://developer.apple.com/programs/)
-2. Create certificate at [developer.apple.com](https://developer.apple.com/account/resources/certificates/list)
-3. Select "Developer ID Application"
-4. Download and install
-
-## Common Workflows
-
-### Local Testing
+To sign updater artifacts during a build, set:
 
 ```bash
-./scripts/build-and-sign-macos.sh
-sudo cp -R "DJ Uploader.app" /Applications/
+export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/dj-uploader-updater.key)"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="…"   # if the key has a password
 ```
 
-### Team Distribution (Signed)
+## Releasing
 
 ```bash
-export ENABLE_CODESIGN=true
-export CODESIGN_IDENTITY="Apple Development: Your Name (TEAMID)"
-./scripts/build-and-sign-macos.sh
-
-# Share: target/DJ-Uploader-Installer.dmg
+./scripts/create-release.sh
 ```
 
-### Public Release (Signed + Notarized)
+This runs `pnpm tauri build`, then creates a **draft** GitHub release with the
+DMG, the updater `*.app.tar.gz` + `.sig`, and a generated `latest.json`. Publish
+with `gh release edit v<version> --draft=false` — `latest.json` must sit on the
+newest published release for the updater to find it.
 
-```bash
-# One-time: Store notarization credentials
-xcrun notarytool store-credentials notarytool-profile \
-  --apple-id 'your@apple.id' \
-  --team-id 'TEAMID'
+## Icons
 
-# Build and notarize
-export ENABLE_CODESIGN=true
-export ENABLE_NOTARIZE=true
-export CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
-export APPLE_ID="your@apple.id"
-export APPLE_TEAM_ID="TEAMID"
-./scripts/build-and-sign-macos.sh
-```
-
-## Troubleshooting
-
-### "No valid identities found"
-
-**Problem:** No code signing certificates installed or certificates not trusted.
-
-**Solution:**
-
-```bash
-./scripts/cert-helper.sh troubleshoot
-./scripts/cert-helper.sh fix
-```
-
-### "CSSMERR_TP_NOT_TRUSTED"
-
-**Problem:** Certificate exists but system doesn't trust it (missing Apple WWDR certificates).
-
-**Solution:**
-
-```bash
-./scripts/cert-helper.sh fix
-```
-
-This automatically downloads and installs Apple's intermediate certificates.
-
-### "Developer cannot be verified" warning
-
-**Problem:** App isn't signed or notarized.
-
-**Solution:** Sign your app with a Developer ID certificate and notarize it.
-
-### Certificate has no private key
-
-**Problem:** Certificate was created on another Mac or imported incorrectly.
-
-**Solution:**
-
-- Recreate the certificate in Xcode on this Mac, OR
-- Export as .p12 from original Mac and import here
-
-### Icon not found warning
-
-**Problem:** No iconset exists at `assets/dj-uploader.iconset/`
-
-**Solution:** Create icons or ignore (default icon will be used)
-
-## Output Files
-
-After building:
-
-- **App Bundle:** `DJ Uploader.app` (for manual installation)
-- **DMG Installer:** `target/DJ-Uploader-Installer.dmg` (for distribution)
-- **Entitlements:** `target/entitlements.plist` (if signed)
+`./scripts/make_icons.sh` regenerates the iconset from a source PNG, or use
+`cargo tauri icon assets/dj-uploader.png` to regenerate `src-tauri/icons/`
+(source image must be square).
 
 ## Prerequisites
 
-- macOS 10.15 or later
-- Xcode Command Line Tools
-- Rust and Cargo
-- (Optional) Apple Developer account for code signing
-
-## Distribution Checklist
-
-Before releasing your app:
-
-- [ ] App builds successfully
-- [ ] App is code signed with Developer ID certificate
-- [ ] App is notarized by Apple
-- [ ] DMG is code signed
-- [ ] Tested on a clean macOS system
-- [ ] No security warnings during installation
-- [ ] App launches correctly from Applications folder
+- macOS 10.15+, Xcode Command Line Tools
+- Rust + Cargo, Node + pnpm
+- (Optional) Apple Developer account for signing/notarization
 
 ## Resources
 
+- [Tauri: macOS code signing](https://tauri.app/distribute/sign/macos/)
+- [Tauri: updater plugin](https://tauri.app/plugin/updater/)
 - [Apple Developer Program](https://developer.apple.com/programs/)
-- [Code Signing Guide](https://developer.apple.com/support/code-signing/)
-- [Notarizing macOS Software](https://developer.apple.com/documentation/security/notarizing_macos_software_before_distribution)
-- [Customizing Notarization Workflow](https://developer.apple.com/documentation/security/customizing_the_notarization_workflow)
-
-## Archive
-
-Legacy scripts have been moved to `archive/` directory and are no longer needed.
