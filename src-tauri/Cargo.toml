@@ -1,0 +1,72 @@
+[package]
+name = "dj-uploader"
+version = "2026.7.0"
+edition = "2024"
+
+[lib]
+# The library holds all app logic so both the Tauri GUI and the CLI bin can use it.
+name = "dj_uploader_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "dj-uploader"
+path = "src/main.rs"
+
+[dependencies]
+aes-gcm = "0.11"
+anyhow = "1.0.103"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.6", features = ["derive"] }
+dirs = "6.0"
+env_logger = "0.11"
+hex = "0.4"
+hound = "3.5"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+keyring-core = "1"
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+log = "0.4"
+minimp3 = "0.6"
+rand = "0.10"
+reqwest = { version = "0.13.4", features = [
+  "blocking",
+  "form",
+  "json",
+  "multipart",
+  "query"
+] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11"
+symphonia = { version = "0.6.0", features = ["all"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-process = "2"
+tokio = { version = "1.52", features = ["full"] }
+url = "2.5"
+urlencoding = "2.1"
+webbrowser = "1.2"
+
+[target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
+tauri-plugin-updater = "2"
+
+[build-dependencies]
+aes-gcm = "0.11"
+hex = "0.4"
+rand = { version = "0.10" }
+serde_json = "1.0"
+tauri-build = { version = "2", features = [] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+# Release profile tuned for a small, optimized binary.
+[profile.release]
+opt-level = 3
+debug = false
+strip = true
+debug-assertions = false
+lto = "fat"
+codegen-units = 1
+panic = "abort"

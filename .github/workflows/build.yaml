@@ -13,7 +13,6 @@ jobs:
     strategy:
       matrix:
         os: [macos-latest, macos-15]
-        rust: [stable]
 
     steps:
       - name: Checkout code
@@ -22,47 +21,51 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
 
-      - name: Install system dependencies (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev pkg-config
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
 
-      - name: Cache cargo registry
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Cache cargo registry and index
         uses: actions/cache@v4
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+            ${{ runner.os }}-cargo-
 
-      - name: Cache cargo index
+      - name: Cache Rust build
         uses: actions/cache@v4
         with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-git-
-
-      - name: Cache target directory
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+          path: src-tauri/target
+          key: ${{ runner.os }}-target-${{ hashFiles('src-tauri/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-target-
 
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The Rust crate embeds the frontend via generate_context!, so dist/ must
+      # exist before any cargo compilation (clippy, build, test).
+      - name: Build frontend
+        run: pnpm build
+
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 
       - name: Run clippy
-        run: |
-          cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 
-      - name: Build
-        run: cargo build --release --verbose
+      - name: Build (release)
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --verbose
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --manifest-path src-tauri/Cargo.toml --verbose

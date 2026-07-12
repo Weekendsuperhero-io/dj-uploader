@@ -1,9 +1,28 @@
+# Rust
 /target
+/src-tauri/target
+/src-tauri/gen/schemas
+
+# Node / frontend
+node_modules
+/dist
+
+# Secrets & tokens
 tokens.json
 config.json
+
+# Local env files with real secrets. The reference file .env.1password
+# (op:// pointers, no secrets) IS committed.
+.env
+.env.*
+!.env.1password
+
+# Media
 *.mp3
 *.wav
 *.flac
+
+# macOS bundles
 *.app
 *.dmg
 *.DS_Store

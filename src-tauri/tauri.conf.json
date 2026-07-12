@@ -1,0 +1,67 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DJ Uploader",
+  "identifier": "com.djuploader.app",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "DJ Uploader",
+        "width": 620,
+        "height": 820,
+        "center": true,
+        "preventOverflow": {
+          "width": 24,
+          "height": 24
+        },
+        "resizable": false,
+        "maximizable": false,
+        "fullscreen": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "createUpdaterArtifacts": true,
+    "category": "Music",
+    "shortDescription": "Upload your DJ mixes to Mixcloud and SoundCloud",
+    "longDescription": "DJ Uploader publishes your DJ mixes to Mixcloud and SoundCloud with OAuth, cover art, tags, scheduled publishing, and optional preview snippets.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "fileAssociations": [
+      {
+        "ext": ["mp3", "m4a", "wav", "flac"],
+        "name": "Audio File",
+        "role": "Viewer"
+      }
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "entitlements": "entitlements.plist"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/WeekendSuperhero/dj-uploader/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZFREJFOTM1N0EyNkRBMjcKUldRbjJpWjZOZW5iYnYzVHM0VExqS2VZMWRwaFNYemdTaEx6aGhmL1c5dVBERDRKNlRaSVBaT3AK"
+    }
+  }
+}
