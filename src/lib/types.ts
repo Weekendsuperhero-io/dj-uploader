@@ -27,6 +27,17 @@ export interface UploadProgress {
   total: number;
 }
 
+/** A transient failure triggered an automatic retry (Rust `UploadRetry`). */
+export interface UploadRetry {
+  platform: string;
+  /** The attempt about to run (1-based). */
+  attempt: number;
+  maxAttempts: number;
+  /** Seconds until the next attempt starts. */
+  delaySecs: number;
+  reason: string;
+}
+
 /** Mirrors the Rust `UploadParams` (serde camelCase). */
 export interface UploadParams {
   filePath: string;

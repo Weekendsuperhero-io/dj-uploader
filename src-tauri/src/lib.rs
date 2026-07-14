@@ -14,6 +14,7 @@ const WINDOW_MARGIN: f64 = 24.0;
 /// Build and run the Tauri desktop application (the GUI entry point).
 pub fn run() {
     let mut builder = tauri::Builder::default()
+        .manage(commands::UploadCancel::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init());
@@ -50,6 +51,7 @@ pub fn run() {
             commands::connect_platform,
             commands::disconnect_platform,
             commands::upload,
+            commands::cancel_upload,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DJ Uploader");

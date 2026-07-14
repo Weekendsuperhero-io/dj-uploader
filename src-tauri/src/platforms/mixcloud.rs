@@ -6,6 +6,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use url::Url;
 
 use crate::config::{MixcloudCredentials, TokenInfo, TokenStorage};
@@ -229,7 +231,9 @@ impl MixcloudClient {
         image_path: Option<&Path>,
         tags: Option<Vec<String>>,
         publish_date: Option<&str>,
-        progress: impl Fn(u64, u64) + Send + 'static,
+        cancel: Arc<AtomicBool>,
+        progress: impl Fn(u64, u64) + Send + Clone + 'static,
+        on_retry: impl FnMut(u32, u32, u64, &str),
     ) -> Result<UploadResponse> {
         // Pre-flight — fail fast, before auth or reading the file into memory.
         if !file_path.exists() {
@@ -247,14 +251,11 @@ impl MixcloudClient {
 
         // Mixcloud tokens are long-lived and have no refresh flow; a revoked
         // token surfaces as a 401 on upload and the user re-authorizes.
-        let token_info = self.token_storage.get_mixcloud_token()?;
+        let access_token = self.token_storage.get_mixcloud_token()?.access_token.clone();
 
         info!("Uploading {} to Mixcloud...", file_path.display());
 
-        // Build multipart form
-        let mut form = multipart::Form::new();
-
-        // Add audio file
+        // Compute the invariant parts once; each retry only rebuilds the form.
         let file_name = file_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -268,28 +269,12 @@ impl MixcloudClient {
             .metadata()
             .context("Failed to read audio file metadata")?
             .len();
-        let audio_file = File::open(file_path).context("Failed to open audio file")?;
-        let reader = super::ProgressReader::new(audio_file, audio_len, progress);
 
-        let file_part = multipart::Part::reader_with_length(reader, audio_len)
-            .file_name(file_name.clone())
-            .mime_str(super::audio_mime(file_path))?;
-
-        form = form.part("mp3", file_part);
-
-        // Add metadata
-        form = form.text("name", title.to_string());
-
-        if let Some(desc) = description {
-            form = form.text("description", desc.to_string());
-        }
-
-        // Add cover image if provided, normalized to square artwork.
-        if let Some(img_path) = image_path
-            && img_path.exists()
-        {
-            let artwork = crate::artwork::prepare(img_path)?;
-            let picture_len = artwork.bytes.len() as u64;
+        // Prepare (and size-check) the cover art once. A bad image is a
+        // permanent error, so surface it here before the retry loop.
+        let artwork = if let Some(img_path) = image_path.filter(|p| p.exists()) {
+            let art = crate::artwork::prepare(img_path)?;
+            let picture_len = art.bytes.len() as u64;
             if picture_len > super::MAX_MIXCLOUD_PICTURE_BYTES {
                 bail!(
                     "Cover art is {} — exceeds Mixcloud's {} picture limit",
@@ -297,56 +282,104 @@ impl MixcloudClient {
                     super::human_bytes(super::MAX_MIXCLOUD_PICTURE_BYTES)
                 );
             }
-            let img_part = multipart::Part::bytes(artwork.bytes)
-                .file_name(artwork.file_name)
-                .mime_str(artwork.mime)?;
-            form = form.part("picture", img_part);
-        }
+            Some(art)
+        } else {
+            None
+        };
 
-        // Add tags if provided (Mixcloud expects tags-0-tag, tags-1-tag, etc.)
-        if let Some(tag_list) = tags {
-            for (index, tag) in tag_list.iter().enumerate() {
-                let field_name = format!("tags-{}-tag", index);
-                form = form.text(field_name, tag.to_string());
+        // One upload attempt: reopen the file, rebuild the multipart form (the
+        // streaming `ProgressReader` is single-use), send, and parse. Wrapped in
+        // `send_with_retry` so a dropped connection retries with backoff instead
+        // of failing outright.
+        let send_once = || -> Result<UploadResponse, super::AttemptError> {
+            let audio_file = File::open(file_path).map_err(|e| {
+                super::AttemptError::Permanent(
+                    anyhow::Error::new(e).context("Failed to open audio file"),
+                )
+            })?;
+            let reader = super::ProgressReader::new(
+                audio_file,
+                audio_len,
+                cancel.clone(),
+                progress.clone(),
+            );
+            let file_part = multipart::Part::reader_with_length(reader, audio_len)
+                .file_name(file_name.clone())
+                .mime_str(super::audio_mime(file_path))
+                .map_err(|e| super::AttemptError::Permanent(anyhow::Error::new(e)))?;
+
+            let mut form = multipart::Form::new().part("mp3", file_part);
+            form = form.text("name", title.to_string());
+            if let Some(desc) = description {
+                form = form.text("description", desc.to_string());
             }
-        }
+            if let Some(art) = &artwork {
+                let img_part = multipart::Part::bytes(art.bytes.clone())
+                    .file_name(art.file_name.clone())
+                    .mime_str(art.mime)
+                    .map_err(|e| super::AttemptError::Permanent(anyhow::Error::new(e)))?;
+                form = form.part("picture", img_part);
+            }
+            // Mixcloud expects tags-0-tag, tags-1-tag, etc.
+            if let Some(tag_list) = &tags {
+                for (index, tag) in tag_list.iter().enumerate() {
+                    form = form.text(format!("tags-{index}-tag"), tag.to_string());
+                }
+            }
+            // publish_date is Pro-only; harmless to include otherwise.
+            if let Some(date) = publish_date {
+                form = form.text("publish_date", date.to_string());
+            }
 
-        // Add publish_date if provided (Pro accounts only)
-        if let Some(date) = publish_date {
-            form = form.text("publish_date", date.to_string());
-            debug!("Scheduling publish for: {}", date);
-        }
+            debug!("Sending upload request...");
+            let response = match self
+                .client
+                .post(UPLOAD_URL)
+                .query(&[("access_token", &access_token)])
+                .multipart(form)
+                .send()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // A cancel surfaces here as a body/stream error; don't retry it.
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(super::AttemptError::Cancelled);
+                    }
+                    return Err(super::AttemptError::Retryable(
+                        anyhow::Error::new(e).context("Failed to upload file"),
+                    ));
+                }
+            };
 
-        debug!("Sending upload request...");
-
-        // Send upload request with OAuth token
-        let response = self
-            .client
-            .post(UPLOAD_URL)
-            .query(&[("access_token", &token_info.access_token)])
-            .multipart(form)
-            .send()
-            .context("Failed to upload file")?;
-
-        if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().unwrap_or_default();
-            bail!("Upload failed with status {}: {}", status, body);
-        }
+            if !status.is_success() {
+                let body = response.text().unwrap_or_default();
+                return Err(super::classify_status(
+                    status,
+                    anyhow::anyhow!("Upload failed with status {status}: {body}"),
+                ));
+            }
 
-        // Get response text first for debugging
-        let response_text = response.text().context("Failed to read response body")?;
+            let response_text = response.text().map_err(|e| {
+                super::AttemptError::Permanent(
+                    anyhow::Error::new(e).context("Failed to read response body"),
+                )
+            })?;
 
-        // Always print the response so we can see what Mixcloud returns
-        println!("\nMixcloud API Response:");
-        println!("{}", response_text);
-        println!();
+            // Always print the response so we can see what Mixcloud returns.
+            println!("\nMixcloud API Response:");
+            println!("{response_text}");
+            println!();
 
-        let upload_response: UploadResponse =
-            serde_json::from_str(&response_text).context("Failed to parse upload response")?;
+            serde_json::from_str(&response_text).map_err(|e| {
+                super::AttemptError::Permanent(
+                    anyhow::Error::new(e).context("Failed to parse upload response"),
+                )
+            })
+        };
 
+        let upload_response = super::send_with_retry(&cancel, on_retry, send_once)?;
         info!("Upload successful!");
-
         Ok(upload_response)
     }
 }

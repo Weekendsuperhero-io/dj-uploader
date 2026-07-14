@@ -10,6 +10,7 @@ import type {
   UploadOutcome,
   UploadParams,
   UploadProgress,
+  UploadRetry,
 } from "./types";
 
 /** Per-platform authorization status from the on-disk token store. */
@@ -32,6 +33,11 @@ export function upload(params: UploadParams): Promise<UploadOutcome[]> {
   return invoke<UploadOutcome[]>("upload", { params });
 }
 
+/** Ask the in-flight upload to stop (aborts the current attempt and any retries). */
+export function cancelUpload(): Promise<void> {
+  return invoke("cancel_upload");
+}
+
 /** Subscribe to human-readable upload stage messages. */
 export function onUploadStage(cb: (message: string) => void): Promise<UnlistenFn> {
   return listen<string>("upload-stage", (e) => cb(e.payload));
@@ -40,6 +46,11 @@ export function onUploadStage(cb: (message: string) => void): Promise<UnlistenFn
 /** Subscribe to byte-level upload progress (for the progress bar). */
 export function onUploadProgress(cb: (p: UploadProgress) => void): Promise<UnlistenFn> {
   return listen<UploadProgress>("upload-progress", (e) => cb(e.payload));
+}
+
+/** Subscribe to automatic-retry notifications (for the "reconnecting…" state). */
+export function onUploadRetry(cb: (r: UploadRetry) => void): Promise<UnlistenFn> {
+  return listen<UploadRetry>("upload-retry", (e) => cb(e.payload));
 }
 
 async function pickFile(name: string, extensions: string[]): Promise<string | null> {

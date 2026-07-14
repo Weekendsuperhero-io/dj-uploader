@@ -17,6 +17,8 @@ import {
   Music,
   Scissors,
   UploadCloud,
+  Wifi,
+  X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Button as GlassButton } from "@/components/ui/glass/button";
@@ -39,11 +41,13 @@ import { DatePickerInput } from "@/components/ui/date-picker-input";
 import { format } from "date-fns";
 import { cn } from "@/lib/utils";
 import {
+  cancelUpload,
   checkForUpdate,
   connectPlatform,
   getAuthStatus,
   installUpdate,
   onUploadProgress,
+  onUploadRetry,
   onUploadStage,
   openUrl,
   pickAudioFile,
@@ -52,6 +56,20 @@ import {
   type Update,
 } from "@/lib/api";
 import type { AuthStatus, Platform, UploadOutcome } from "@/lib/types";
+
+/** Live state for the upload progress area. */
+type UploadProgressState = {
+  platform: string;
+  pct: number;
+  /** `uploading` streams bytes; `retrying` is waiting to reconnect; `cancelling` is stopping. */
+  phase: "uploading" | "retrying" | "cancelling";
+  retry?: { attempt: number; maxAttempts: number; delaySecs: number };
+};
+
+/** True when a failed outcome is the result of the user cancelling. */
+function isCancelled(o: UploadOutcome): boolean {
+  return !o.success && (o.error ?? "").toLowerCase().includes("cancel");
+}
 
 function basename(p: string): string {
   const parts = p.split(/[\\/]/);
@@ -95,7 +113,7 @@ export default function App() {
   const [auth, setAuth] = useState<AuthStatus | null>(null);
   const [connecting, setConnecting] = useState<Platform | null>(null);
   const [isUploading, setIsUploading] = useState(false);
-  const [progress, setProgress] = useState<{ platform: string; pct: number } | null>(null);
+  const [progress, setProgress] = useState<UploadProgressState | null>(null);
   const [results, setResults] = useState<UploadOutcome[]>([]);
   const [update, setUpdate] = useState<Update | null>(null);
   const [installing, setInstalling] = useState(false);
@@ -113,14 +131,32 @@ export default function App() {
     checkForUpdate().then(setUpdate);
     const unlistenStage = onUploadStage((msg) => toast.message(msg));
     const unlistenProgress = onUploadProgress((p) =>
-      setProgress({
+      setProgress((prev) => ({
         platform: p.platform,
         pct: p.total > 0 ? Math.round((p.sent / p.total) * 100) : 0,
-      }),
+        // Bytes are flowing again → back to uploading, unless the user is
+        // actively cancelling (keep that state until the upload returns).
+        phase: prev?.phase === "cancelling" ? "cancelling" : "uploading",
+        retry: undefined,
+      })),
+    );
+    const unlistenRetry = onUploadRetry((r) =>
+      setProgress((prev) => ({
+        platform: r.platform,
+        // The next attempt restarts from the beginning.
+        pct: 0,
+        phase: prev?.phase === "cancelling" ? "cancelling" : "retrying",
+        retry: {
+          attempt: r.attempt,
+          maxAttempts: r.maxAttempts,
+          delaySecs: r.delaySecs,
+        },
+      })),
     );
     return () => {
       unlistenStage.then((fn) => fn());
       unlistenProgress.then((fn) => fn());
+      unlistenRetry.then((fn) => fn());
     };
   }, []);
 
@@ -254,6 +290,8 @@ export default function App() {
               ? { label: "Open", onClick: () => openUrl(o.url) }
               : undefined,
           });
+        } else if (isCancelled(o)) {
+          toast.message(`${o.platform} · upload cancelled`);
         } else {
           toast.error(`${o.platform} upload failed`, {
             description: o.error ?? "Unknown upload error",
@@ -284,6 +322,15 @@ export default function App() {
     } finally {
       setIsUploading(false);
       setProgress(null);
+    }
+  };
+
+  const handleCancel = async () => {
+    setProgress((prev) => (prev ? { ...prev, phase: "cancelling" } : prev));
+    try {
+      await cancelUpload();
+    } catch (e) {
+      toast.error("Couldn't cancel the upload", { description: String(e) });
     }
   };
 
@@ -636,22 +683,59 @@ export default function App() {
           {isUploading ? "Uploading…" : "Upload"}
         </GlassButton>
 
-        {/* Upload progress bar */}
+        {/* Upload progress */}
         {isUploading && progress && (
-          <div className="space-y-1">
-            <div className="flex justify-between text-xs text-muted-foreground">
-              <span>
-                Uploading to{" "}
-                {progress.platform === "mixcloud" ? "Mixcloud" : "SoundCloud"}…
-              </span>
-              <span className="tabular-nums">{progress.pct}%</span>
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between gap-2 text-xs">
+              {progress.phase === "retrying" && progress.retry ? (
+                <span className="flex items-center gap-1.5 text-amber-300">
+                  <Wifi className="size-3.5 animate-pulse" />
+                  Connection unstable — reconnecting… (attempt{" "}
+                  {progress.retry.attempt} of {progress.retry.maxAttempts})
+                </span>
+              ) : progress.phase === "cancelling" ? (
+                <span className="text-muted-foreground">Cancelling…</span>
+              ) : (
+                <span className="text-muted-foreground">
+                  Uploading to{" "}
+                  {progress.platform === "mixcloud" ? "Mixcloud" : "SoundCloud"}…
+                </span>
+              )}
+              <div className="flex shrink-0 items-center gap-2">
+                {progress.phase !== "retrying" && (
+                  <span className="tabular-nums text-muted-foreground">
+                    {progress.pct}%
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={handleCancel}
+                  disabled={progress.phase === "cancelling"}
+                  className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-muted-foreground transition-colors hover:text-red-300 disabled:opacity-50"
+                  title="Cancel upload"
+                >
+                  <X className="size-3.5" />
+                  Cancel
+                </button>
+              </div>
             </div>
             <div className="h-2 w-full overflow-hidden rounded-full bg-white/10">
               <div
-                className="h-full rounded-full transition-[width] duration-150"
+                className={cn(
+                  "h-full rounded-full transition-[width] duration-150",
+                  progress.phase === "retrying" && "animate-pulse",
+                )}
                 style={{
-                  width: `${progress.pct}%`,
-                  backgroundImage: "var(--gradient-text)",
+                  width:
+                    progress.phase === "retrying" ? "100%" : `${progress.pct}%`,
+                  backgroundImage:
+                    progress.phase === "retrying"
+                      ? "none"
+                      : "var(--gradient-text)",
+                  backgroundColor:
+                    progress.phase === "retrying"
+                      ? "rgb(251 191 36 / 0.35)"
+                      : undefined,
                 }}
               />
             </div>
@@ -665,36 +749,47 @@ export default function App() {
               <CheckCircle2 className="size-3.5" /> Upload results
             </p>
             <ul className="space-y-1">
-              {results.map((r) => (
-                <li
-                  key={r.platform}
-                  className="flex items-center justify-between gap-2"
-                >
-                  <span
-                    className={cn(
-                      "truncate",
-                      r.success ? "text-emerald-300" : "text-red-300",
-                    )}
+              {results.map((r) => {
+                const cancelled = isCancelled(r);
+                return (
+                  <li
+                    key={r.platform}
+                    className="flex items-center justify-between gap-2"
                   >
-                    {r.platform}
-                  </span>
-                  {r.success && r.url ? (
-                    <button
-                      type="button"
-                      onClick={() => openUrl(r.url)}
-                      className="shrink-0 text-[var(--glass-accent)] underline-offset-2 hover:underline"
+                    <span
+                      className={cn(
+                        "truncate",
+                        r.success
+                          ? "text-emerald-300"
+                          : cancelled
+                            ? "text-muted-foreground"
+                            : "text-red-300",
+                      )}
                     >
-                      Open ↗
-                    </button>
-                  ) : r.success ? (
-                    <span className="shrink-0 text-muted-foreground">done</span>
-                  ) : (
-                    <span className="max-w-56 truncate text-xs text-red-300" title={r.error ?? undefined}>
-                      {r.error ?? "failed"}
+                      {r.platform}
                     </span>
-                  )}
-                </li>
-              ))}
+                    {r.success && r.url ? (
+                      <button
+                        type="button"
+                        onClick={() => openUrl(r.url)}
+                        className="shrink-0 text-[var(--glass-accent)] underline-offset-2 hover:underline"
+                      >
+                        Open ↗
+                      </button>
+                    ) : r.success ? (
+                      <span className="shrink-0 text-muted-foreground">done</span>
+                    ) : cancelled ? (
+                      <span className="shrink-0 text-xs text-muted-foreground">
+                        cancelled
+                      </span>
+                    ) : (
+                      <span className="max-w-56 truncate text-xs text-red-300" title={r.error ?? undefined}>
+                        {r.error ?? "failed"}
+                      </span>
+                    )}
+                  </li>
+                );
+              })}
             </ul>
           </div>
         )}

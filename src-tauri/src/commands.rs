@@ -6,7 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter, Window};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::{AppHandle, Emitter, State, Window};
 
 use crate::config::{TokenInfo, TokenStorage};
 
@@ -14,6 +16,15 @@ use crate::config::{TokenInfo, TokenStorage};
 const UPLOAD_STAGE_EVENT: &str = "upload-stage";
 /// Event carrying byte-level upload progress, for the progress bar.
 const UPLOAD_PROGRESS_EVENT: &str = "upload-progress";
+/// Event fired when a transient failure triggers an automatic retry.
+const UPLOAD_RETRY_EVENT: &str = "upload-retry";
+
+/// Shared "please cancel the upload" flag. Only one upload runs at a time (the
+/// UI disables the button while uploading), so a single flag suffices. Held as
+/// Tauri managed state so the `cancel_upload` command and the running upload
+/// share it.
+#[derive(Clone, Default)]
+pub struct UploadCancel(pub Arc<AtomicBool>);
 
 /// Byte progress payload for the `upload-progress` event.
 #[derive(Serialize, Clone)]
@@ -21,6 +32,18 @@ struct UploadProgress {
     platform: String,
     sent: u64,
     total: u64,
+}
+
+/// Payload for the `upload-retry` event, so the UI can show a "reconnecting…"
+/// state (which attempt, how long until the next try) instead of failing.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct UploadRetry {
+    platform: String,
+    attempt: u32,
+    max_attempts: u32,
+    delay_secs: u64,
+    reason: String,
 }
 
 /// Where a track landed, returned to the frontend so it can show a link.
@@ -131,7 +154,11 @@ pub struct UploadParams {
 /// Emits `upload-stage` (message) and `upload-progress` (bytes) events while it
 /// works. Returns one `UploadOutcome` per platform (with the public track URL).
 #[tauri::command]
-pub async fn upload(app: AppHandle, params: UploadParams) -> Result<Vec<UploadOutcome>, String> {
+pub async fn upload(
+    app: AppHandle,
+    cancel: State<'_, UploadCancel>,
+    params: UploadParams,
+) -> Result<Vec<UploadOutcome>, String> {
     if params.file_path.is_empty() || params.title.is_empty() {
         return Err("File and title are required".into());
     }
@@ -139,9 +166,21 @@ pub async fn upload(app: AppHandle, params: UploadParams) -> Result<Vec<UploadOu
         return Err("Select at least one platform".into());
     }
 
-    tauri::async_runtime::spawn_blocking(move || perform_upload(&app, params))
+    // Clear any leftover cancel request from a previous upload before starting.
+    let cancel = cancel.0.clone();
+    cancel.store(false, Ordering::Relaxed);
+
+    tauri::async_runtime::spawn_blocking(move || perform_upload(&app, &cancel, params))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Signal the in-flight upload to stop. The `ProgressReader` polls this flag and
+/// aborts the current request; the retry loop then stops instead of retrying.
+#[tauri::command]
+pub async fn cancel_upload(cancel: State<'_, UploadCancel>) -> Result<(), String> {
+    cancel.0.store(true, Ordering::Relaxed);
+    Ok(())
 }
 
 fn emit_stage(app: &AppHandle, message: &str) {
@@ -149,7 +188,7 @@ fn emit_stage(app: &AppHandle, message: &str) {
 }
 
 /// Build a `Fn(sent, total)` that emits byte-progress events for one platform.
-fn progress_emitter(app: &AppHandle, platform: &str) -> impl Fn(u64, u64) + Send + 'static {
+fn progress_emitter(app: &AppHandle, platform: &str) -> impl Fn(u64, u64) + Send + Clone + 'static {
     let app = app.clone();
     let platform = platform.to_string();
     move |sent, total| {
@@ -164,7 +203,30 @@ fn progress_emitter(app: &AppHandle, platform: &str) -> impl Fn(u64, u64) + Send
     }
 }
 
-fn perform_upload(app: &AppHandle, p: UploadParams) -> Result<Vec<UploadOutcome>, String> {
+/// Build an `FnMut(attempt, max, delay_secs, reason)` that emits retry events for
+/// one platform, so the UI can show a "reconnecting…" state between attempts.
+fn retry_emitter(app: &AppHandle, platform: &str) -> impl FnMut(u32, u32, u64, &str) {
+    let app = app.clone();
+    let platform = platform.to_string();
+    move |attempt, max_attempts, delay_secs, reason| {
+        let _ = app.emit(
+            UPLOAD_RETRY_EVENT,
+            UploadRetry {
+                platform: platform.clone(),
+                attempt,
+                max_attempts,
+                delay_secs,
+                reason: reason.to_string(),
+            },
+        );
+    }
+}
+
+fn perform_upload(
+    app: &AppHandle,
+    cancel: &Arc<AtomicBool>,
+    p: UploadParams,
+) -> Result<Vec<UploadOutcome>, String> {
     use crate::platforms::{mixcloud, soundcloud as sc};
     use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 
@@ -254,7 +316,9 @@ fn perform_upload(app: &AppHandle, p: UploadParams) -> Result<Vec<UploadOutcome>
                 image.as_deref(),
                 tag_list.clone(),
                 publish_date.as_deref(),
+                cancel.clone(),
                 progress_emitter(app, "mixcloud"),
+                retry_emitter(app, "mixcloud"),
             )
         });
         match result {
@@ -284,7 +348,9 @@ fn perform_upload(app: &AppHandle, p: UploadParams) -> Result<Vec<UploadOutcome>
                 desc,
                 image.as_deref(),
                 tag_list,
+                cancel.clone(),
                 progress_emitter(app, "soundcloud"),
+                retry_emitter(app, "soundcloud"),
             )
         });
         match result {
