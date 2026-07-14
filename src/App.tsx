@@ -109,6 +109,10 @@ export default function App() {
   const [scheduleDate, setScheduleDate] = useState("");
   const [scheduleTime, setScheduleTime] = useState("");
   const [generatePreviews, setGeneratePreviews] = useState(false);
+  // Persisted: once a user finds this fixes their uploads, it should stick.
+  const [forceHttp1, setForceHttp1] = useState<boolean>(
+    () => localStorage.getItem("forceHttp1") === "true",
+  );
 
   const [auth, setAuth] = useState<AuthStatus | null>(null);
   const [connecting, setConnecting] = useState<Platform | null>(null);
@@ -159,6 +163,10 @@ export default function App() {
       unlistenRetry.then((fn) => fn());
     };
   }, []);
+
+  useEffect(() => {
+    localStorage.setItem("forceHttp1", String(forceHttp1));
+  }, [forceHttp1]);
 
   useLayoutEffect(() => {
     const layout = layoutRef.current;
@@ -280,6 +288,7 @@ export default function App() {
         scheduleDate,
         scheduleTime,
         generatePreviews,
+        forceHttp1,
       });
       setResults(outcomes);
       for (const o of outcomes) {
@@ -663,6 +672,22 @@ export default function App() {
               </Label>
             </CardContent>
           </Card>
+        </div>
+
+        {/* Connection compatibility toggle (troubleshooting) */}
+        <div className="flex items-start gap-2 px-1">
+          <Switch
+            id="force-http1"
+            checked={forceHttp1}
+            onCheckedChange={setForceHttp1}
+            className="mt-0.5"
+          />
+          <Label htmlFor="force-http1" className="text-xs leading-tight">
+            Compatibility mode (HTTP/1.1)
+            <span className="mt-0.5 block font-normal text-[11px] text-muted-foreground">
+              Try this if uploads keep failing partway.
+            </span>
+          </Label>
         </div>
 
         </div>

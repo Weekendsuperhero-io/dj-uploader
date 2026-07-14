@@ -56,6 +56,10 @@ pub enum Commands {
         /// Generate preview snippets (30s, 60s, 90s) in the same folder
         #[arg(long)]
         generate_previews: bool,
+
+        /// Force HTTP/1.1 for the upload (try this if uploads fail partway)
+        #[arg(long)]
+        http1: bool,
     },
     /// Show current configuration status
     Status,

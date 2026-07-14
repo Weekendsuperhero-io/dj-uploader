@@ -1096,7 +1096,7 @@ dependencies = [
 
 [[package]]
 name = "dj-uploader"
-version = "2026.7.1"
+version = "2026.7.2"
 dependencies = [
  "aes-gcm",
  "anyhow",

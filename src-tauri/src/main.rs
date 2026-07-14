@@ -33,6 +33,7 @@ fn main() -> Result<()> {
             tags,
             publish_date,
             generate_previews,
+            http1,
         }) => {
             let tag_list = tags.map(|t| {
                 t.split(',')
@@ -87,6 +88,7 @@ fn main() -> Result<()> {
                 image.as_deref(),
                 tag_list,
                 publish_date_utc.as_deref(),
+                http1,
             )?;
         }
         Some(cli::Commands::Status) => {

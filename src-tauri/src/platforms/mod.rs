@@ -268,6 +268,7 @@ fn cli_retry(attempt: u32, max: u32, delay_secs: u64, reason: &str) {
     eprintln!("\n  Connection issue ({reason}). Retrying (attempt {attempt}/{max}) in {delay_secs}s…");
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn handle_upload(
     platform: Platform,
     file_path: &Path,
@@ -276,6 +277,7 @@ pub fn handle_upload(
     image_path: Option<&Path>,
     tags: Option<Vec<String>>,
     publish_date: Option<&str>,
+    force_http1: bool,
 ) -> Result<()> {
     // The CLI has no way to cancel mid-upload, so hand the uploader a flag that
     // is never set; retries are surfaced as a one-line stderr notice.
@@ -283,7 +285,7 @@ pub fn handle_upload(
 
     match platform {
         Platform::Mixcloud => {
-            let mut client = mixcloud::MixcloudClient::new()?;
+            let mut client = mixcloud::MixcloudClient::new(force_http1)?;
             let response = client.upload(
                 file_path,
                 title,
@@ -305,7 +307,7 @@ pub fn handle_upload(
             }
         }
         Platform::Soundcloud => {
-            let mut client = soundcloud::SoundcloudClient::new()?;
+            let mut client = soundcloud::SoundcloudClient::new(force_http1)?;
             let response = client.upload(
                 file_path,
                 title,

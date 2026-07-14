@@ -62,16 +62,22 @@ pub struct SoundcloudClient {
 }
 
 impl SoundcloudClient {
-    pub fn new() -> Result<Self> {
+    /// `force_http1` pins uploads to HTTP/1.1. A large streaming upload over
+    /// HTTP/2 can be cut off at a fixed byte offset (h2 flow-control stalls,
+    /// proxy body-window limits) — the "always fails at the same percentage"
+    /// symptom — so the UI exposes this as a compatibility toggle.
+    pub fn new(force_http1: bool) -> Result<Self> {
         // No overall request timeout: a large mix on a slow uplink must not be
         // cut off while it's still making progress. Instead, bound the initial
         // connect and use TCP keepalive so a genuinely dead/stalled connection
         // still errors out during a long upload.
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(30))
-            .tcp_keepalive(std::time::Duration::from_secs(60))
-            .build()
-            .context("Failed to create HTTP client")?;
+            .tcp_keepalive(std::time::Duration::from_secs(60));
+        if force_http1 {
+            builder = builder.http1_only();
+        }
+        let client = builder.build().context("Failed to create HTTP client")?;
 
         let credentials = SoundcloudCredentials::new();
         let token_storage = TokenStorage::load()?;
@@ -448,6 +454,7 @@ impl SoundcloudClient {
             form = form.text("track[sharing]", "public");
 
             debug!("Sending upload request...");
+            let started = std::time::Instant::now();
             let response = match self
                 .client
                 .post(UPLOAD_URL)
@@ -461,9 +468,15 @@ impl SoundcloudClient {
                     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                         return Err(super::AttemptError::Cancelled);
                     }
-                    return Err(super::AttemptError::Retryable(
-                        anyhow::Error::new(e).context("Failed to upload file"),
-                    ));
+                    // Note the elapsed time: a *constant* time-to-failure points at
+                    // a proxy duration timeout; a constant *byte offset* points at
+                    // an h2/body-size cutoff.
+                    return Err(super::AttemptError::Retryable(anyhow::Error::new(e).context(
+                        format!(
+                            "Upload connection failed after {:.1}s",
+                            started.elapsed().as_secs_f64()
+                        ),
+                    )));
                 }
             };
 
@@ -472,7 +485,10 @@ impl SoundcloudClient {
                 let body = response.text().unwrap_or_default();
                 return Err(super::classify_status(
                     status,
-                    anyhow::anyhow!("Upload failed with status {status}: {body}"),
+                    anyhow::anyhow!(
+                        "Upload rejected with status {status} after {:.1}s: {body}",
+                        started.elapsed().as_secs_f64()
+                    ),
                 ));
             }
 

@@ -148,6 +148,9 @@ pub struct UploadParams {
     pub schedule_date: String,
     pub schedule_time: String,
     pub generate_previews: bool,
+    /// Pin uploads to HTTP/1.1 (compatibility mode for networks that cut off
+    /// HTTP/2 streaming uploads at a fixed point).
+    pub force_http1: bool,
 }
 
 /// Optionally generate preview snippets, then upload to the selected platforms.
@@ -308,7 +311,7 @@ fn perform_upload(
 
     if p.mixcloud {
         emit_stage(app, "Uploading to Mixcloud…");
-        let result = mixcloud::MixcloudClient::new().and_then(|mut client| {
+        let result = mixcloud::MixcloudClient::new(p.force_http1).and_then(|mut client| {
             client.upload(
                 &file,
                 &p.title,
@@ -334,14 +337,16 @@ fn perform_upload(
                 title: p.title.clone(),
                 url: String::new(),
                 success: false,
-                error: Some(error.to_string()),
+                // `{:#}` includes the full cause chain (e.g. "…: connection reset
+                // by peer") so a mid-upload failure is actually diagnosable.
+                error: Some(format!("{error:#}")),
             }),
         }
     }
 
     if p.soundcloud {
         emit_stage(app, "Uploading to SoundCloud…");
-        let result = sc::SoundcloudClient::new().and_then(|mut client| {
+        let result = sc::SoundcloudClient::new(p.force_http1).and_then(|mut client| {
             client.upload(
                 &file,
                 &p.title,
@@ -366,7 +371,9 @@ fn perform_upload(
                 title: p.title.clone(),
                 url: String::new(),
                 success: false,
-                error: Some(error.to_string()),
+                // `{:#}` includes the full cause chain (e.g. "…: connection reset
+                // by peer") so a mid-upload failure is actually diagnosable.
+                error: Some(format!("{error:#}")),
             }),
         }
     }

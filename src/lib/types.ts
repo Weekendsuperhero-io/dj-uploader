@@ -51,4 +51,6 @@ export interface UploadParams {
   scheduleDate: string;
   scheduleTime: string;
   generatePreviews: boolean;
+  /** Pin uploads to HTTP/1.1 — compatibility mode for flaky networks. */
+  forceHttp1: boolean;
 }
