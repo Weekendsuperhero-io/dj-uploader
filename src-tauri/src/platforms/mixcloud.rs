@@ -237,7 +237,8 @@ impl MixcloudClient {
         tags: Option<Vec<String>>,
         publish_date: Option<&str>,
         cancel: Arc<AtomicBool>,
-        progress: impl Fn(u64, u64) + Send + Clone + 'static,
+        // `(sent, total, kind)` — kind is "reading" (disk→RAM) or "sending" (HTTP).
+        progress: impl Fn(u64, u64, &str) + Send + Clone + 'static,
         on_retry: impl FnMut(u32, u32, u64, &str),
     ) -> Result<UploadResponse> {
         // Pre-flight — fail fast, before auth or reading the file into memory.
@@ -295,15 +296,19 @@ impl MixcloudClient {
                 return Err(super::AttemptError::Cancelled);
             }
 
+            // Progress bar tracks disk reads into RAM (not the HTTP body stream —
+            // streaming multipart parts is what broke uploads for some users).
+            let on_read = {
+                let progress = progress.clone();
+                move |sent, total| progress(sent, total, "reading")
+            };
+            let file_bytes = super::read_audio_buffered(file_path, &cancel, on_read)?;
+            let audio_len = file_bytes.len() as u64;
+
             // Mixcloud's field is named `mp3` and historically expected
             // audio/mpeg; keep that for maximum server-side compatibility.
-            let file_part = super::audio_part_buffered(
-                file_path,
-                file_name.clone(),
-                "audio/mpeg",
-                &progress,
-            )
-            .map_err(super::AttemptError::Permanent)?;
+            let file_part = super::audio_part_from_bytes(file_bytes, file_name.clone(), "audio/mpeg")
+                .map_err(super::AttemptError::Permanent)?;
 
             let mut form = multipart::Form::new().part("mp3", file_part);
             form = form.text("name", title.to_string());
@@ -327,6 +332,10 @@ impl MixcloudClient {
             if let Some(date) = publish_date {
                 form = form.text("publish_date", date.to_string());
             }
+
+            // Switch the UI to an indeterminate "sending" phase — `Part::bytes`
+            // has no mid-body byte callback.
+            progress(0, audio_len, "sending");
 
             debug!("Sending upload request...");
             let started = std::time::Instant::now();
@@ -383,9 +392,7 @@ impl MixcloudClient {
                     anyhow::Error::new(e).context("Failed to parse upload response"),
                 )
             })?;
-            // `Part::bytes` has no mid-body progress; snap the bar to 100% on success.
-            let audio_len = file_path.metadata().map(|m| m.len()).unwrap_or(0);
-            progress(audio_len, audio_len);
+            progress(audio_len, audio_len, "sending");
             Ok(parsed)
         };
 

@@ -61,8 +61,12 @@ import type { AuthStatus, Platform, UploadOutcome } from "@/lib/types";
 type UploadProgressState = {
   platform: string;
   pct: number;
-  /** `uploading` streams bytes; `retrying` is waiting to reconnect; `cancelling` is stopping. */
-  phase: "uploading" | "retrying" | "cancelling";
+  /**
+   * `reading` — determinate bar while loading the file into memory.
+   * `sending` — HTTP in flight (indeterminate; `Part::bytes` has no mid-body ticks).
+   * `retrying` — waiting to reconnect; `cancelling` — stopping.
+   */
+  phase: "reading" | "sending" | "retrying" | "cancelling";
   retry?: { attempt: number; maxAttempts: number; delaySecs: number };
 };
 
@@ -135,14 +139,26 @@ export default function App() {
     checkForUpdate().then(setUpdate);
     const unlistenStage = onUploadStage((msg) => toast.message(msg));
     const unlistenProgress = onUploadProgress((p) =>
-      setProgress((prev) => ({
-        platform: p.platform,
-        pct: p.total > 0 ? Math.round((p.sent / p.total) * 100) : 0,
-        // Bytes are flowing again → back to uploading, unless the user is
-        // actively cancelling (keep that state until the upload returns).
-        phase: prev?.phase === "cancelling" ? "cancelling" : "uploading",
-        retry: undefined,
-      })),
+      setProgress((prev) => {
+        if (prev?.phase === "cancelling") {
+          return { ...prev, platform: p.platform };
+        }
+        const kind = p.kind === "sending" ? "sending" : "reading";
+        return {
+          platform: p.platform,
+          // Determinate only while reading from disk; sending is indeterminate.
+          pct:
+            kind === "reading" && p.total > 0
+              ? Math.round((p.sent / p.total) * 100)
+              : kind === "sending" && p.sent >= p.total && p.total > 0
+                ? 100
+                : prev?.phase === "sending"
+                  ? (prev.pct ?? 0)
+                  : 0,
+          phase: kind,
+          retry: undefined,
+        };
+      }),
     );
     const unlistenRetry = onUploadRetry((r) =>
       setProgress((prev) => ({
@@ -720,6 +736,8 @@ export default function App() {
                 </span>
               ) : progress.phase === "cancelling" ? (
                 <span className="text-muted-foreground">Cancelling…</span>
+              ) : progress.phase === "reading" ? (
+                <span className="text-muted-foreground">Reading mix into memory…</span>
               ) : (
                 <span className="text-muted-foreground">
                   Uploading to{" "}
@@ -727,7 +745,7 @@ export default function App() {
                 </span>
               )}
               <div className="flex shrink-0 items-center gap-2">
-                {progress.phase !== "retrying" && (
+                {progress.phase === "reading" && (
                   <span className="tabular-nums text-muted-foreground">
                     {progress.pct}%
                   </span>
@@ -748,11 +766,15 @@ export default function App() {
               <div
                 className={cn(
                   "h-full rounded-full transition-[width] duration-150",
-                  progress.phase === "retrying" && "animate-pulse",
+                  (progress.phase === "retrying" ||
+                    progress.phase === "sending") &&
+                    "animate-pulse",
                 )}
                 style={{
                   width:
-                    progress.phase === "retrying" ? "100%" : `${progress.pct}%`,
+                    progress.phase === "retrying" || progress.phase === "sending"
+                      ? "100%"
+                      : `${progress.pct}%`,
                   backgroundImage:
                     progress.phase === "retrying"
                       ? "none"
@@ -761,6 +783,7 @@ export default function App() {
                     progress.phase === "retrying"
                       ? "rgb(251 191 36 / 0.35)"
                       : undefined,
+                  opacity: progress.phase === "sending" ? 0.55 : 1,
                 }}
               />
             </div>

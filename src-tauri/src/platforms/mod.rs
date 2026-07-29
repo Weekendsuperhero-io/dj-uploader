@@ -5,12 +5,62 @@ use anyhow::{Context, Result, bail};
 use log::debug;
 use reqwest::StatusCode;
 use reqwest::blocking::multipart;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cli::Platform;
 use crate::config::TokenStorage;
+
+/// A `Read` wrapper that reports cumulative bytes read to a callback, throttled
+/// so it fires at most ~once per 1% (and never more often than every 256 KiB) to
+/// avoid flooding the IPC event channel.
+///
+/// Used while loading the audio file into memory (the progress bar tracks disk
+/// reads). It also polls a shared `cancel` flag on every `read`.
+pub(crate) struct ProgressReader<R, F> {
+    inner: R,
+    total: u64,
+    read: u64,
+    last_emitted: u64,
+    step: u64,
+    cancel: Arc<AtomicBool>,
+    callback: F,
+}
+
+impl<R: Read, F: Fn(u64, u64)> ProgressReader<R, F> {
+    pub(crate) fn new(inner: R, total: u64, cancel: Arc<AtomicBool>, callback: F) -> Self {
+        let step = (total / 100).max(256 * 1024);
+        Self {
+            inner,
+            total,
+            read: 0,
+            last_emitted: 0,
+            step,
+            cancel,
+            callback,
+        }
+    }
+}
+
+impl<R: Read, F: Fn(u64, u64)> Read for ProgressReader<R, F> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("upload cancelled"));
+        }
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.read += n as u64;
+            if self.read - self.last_emitted >= self.step || self.read >= self.total {
+                self.last_emitted = self.read;
+                (self.callback)(self.read, self.total);
+            }
+        }
+        Ok(n)
+    }
+}
 
 /// Number of upload attempts before giving up (1 initial + 5 retries).
 pub(crate) const MAX_UPLOAD_ATTEMPTS: u32 = 6;
@@ -192,26 +242,57 @@ pub(crate) fn audio_mime(path: &Path) -> &'static str {
     }
 }
 
-/// Build an audio multipart part the way the pre-rewrite app did: load the whole
-/// file into memory and attach it with [`multipart::Part::bytes`].
+/// Load an audio file into memory, reporting **byte-read** progress (disk → RAM)
+/// via `on_read(sent, total)`. Cancel is honored between reads.
 ///
-/// Streaming via `Part::reader_with_length` (even with a known length, and even
-/// pinned to HTTP/1.1) failed for some users on large mixes — connection drops
-/// mid-body that the old buffered path never hit. Buffering uses more RAM but
-/// is the proven-reliable path for Mixcloud/SoundCloud.
-///
-/// `progress` is invoked once after the file is loaded (`0, len`) and again
-/// after a successful response path should call `progress(len, len)`. Mid-body
-/// byte progress is not available with `Part::bytes`.
-pub(crate) fn audio_part_buffered(
+/// The HTTP send still uses [`multipart::Part::bytes`] (not a streaming body),
+/// so mid-network progress is not available — callers should switch the UI to a
+/// "sending" phase after this returns.
+pub(crate) fn read_audio_buffered(
     file_path: &Path,
+    cancel: &Arc<AtomicBool>,
+    on_read: impl Fn(u64, u64),
+) -> Result<Vec<u8>, AttemptError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(AttemptError::Cancelled);
+    }
+    let file = File::open(file_path).map_err(|e| {
+        AttemptError::Permanent(anyhow::Error::new(e).context("Failed to open audio file"))
+    })?;
+    let len = file
+        .metadata()
+        .map_err(|e| {
+            AttemptError::Permanent(
+                anyhow::Error::new(e).context("Failed to read audio file metadata"),
+            )
+        })?
+        .len();
+
+    // Seed the bar so the UI has a total before the first throttled tick.
+    on_read(0, len);
+
+    let mut reader = ProgressReader::new(file, len, cancel.clone(), on_read);
+    let mut bytes = Vec::with_capacity(len as usize);
+    match reader.read_to_end(&mut bytes) {
+        // ProgressReader already emits the final (len, len) tick when the last
+        // chunk is read; no need to call on_read again (it was moved into the reader).
+        Ok(_) => Ok(bytes),
+        Err(_) if cancel.load(Ordering::Relaxed) => Err(AttemptError::Cancelled),
+        Err(e) => Err(AttemptError::Permanent(
+            anyhow::Error::new(e).context("Failed to read audio file"),
+        )),
+    }
+}
+
+/// Attach pre-loaded audio bytes as a multipart part (`Part::bytes`).
+///
+/// Streaming via `Part::reader_with_length` failed for some users on large mixes
+/// even with HTTP/1.1 — buffering is the proven-reliable path.
+pub(crate) fn audio_part_from_bytes(
+    file_bytes: Vec<u8>,
     file_name: String,
     mime: &str,
-    progress: &impl Fn(u64, u64),
 ) -> Result<multipart::Part> {
-    let file_bytes = std::fs::read(file_path).context("Failed to read audio file")?;
-    let len = file_bytes.len() as u64;
-    progress(0, len);
     multipart::Part::bytes(file_bytes)
         .file_name(file_name)
         .mime_str(mime)
@@ -231,10 +312,19 @@ pub fn handle_auth(platform: Platform) -> Result<()> {
 }
 
 /// Simple upload progress for the CLI: overwrites one stderr line with a percent.
-fn cli_progress(sent: u64, total: u64) {
+fn cli_progress(sent: u64, total: u64, kind: &str) {
     use std::io::Write;
+    if kind == "sending" {
+        if sent >= total && total > 0 {
+            eprint!("\r  Uploading: done        ");
+        } else {
+            eprint!("\r  Uploading: sending…   ");
+        }
+        let _ = std::io::stderr().flush();
+        return;
+    }
     if let Some(pct) = (sent * 100).checked_div(total) {
-        eprint!("\r  Uploading: {pct}%   ");
+        eprint!("\r  Reading file: {pct}%   ");
         let _ = std::io::stderr().flush();
     }
 }

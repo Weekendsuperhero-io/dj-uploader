@@ -32,6 +32,9 @@ struct UploadProgress {
     platform: String,
     sent: u64,
     total: u64,
+    /// `"reading"` = loading the file from disk into memory (determinate %).
+    /// `"sending"` = HTTP multipart request in flight (no mid-body byte ticks).
+    kind: String,
 }
 
 /// Payload for the `upload-retry` event, so the UI can show a "reconnecting…"
@@ -191,17 +194,22 @@ fn emit_stage(app: &AppHandle, message: &str) {
     let _ = app.emit(UPLOAD_STAGE_EVENT, message.to_string());
 }
 
-/// Build a `Fn(sent, total)` that emits byte-progress events for one platform.
-fn progress_emitter(app: &AppHandle, platform: &str) -> impl Fn(u64, u64) + Send + Clone + 'static {
+/// Build a `Fn(sent, total, kind)` that emits byte-progress events for one platform.
+/// `kind` is `"reading"` (disk→RAM, determinate) or `"sending"` (HTTP in flight).
+fn progress_emitter(
+    app: &AppHandle,
+    platform: &str,
+) -> impl Fn(u64, u64, &str) + Send + Clone + 'static {
     let app = app.clone();
     let platform = platform.to_string();
-    move |sent, total| {
+    move |sent, total, kind| {
         let _ = app.emit(
             UPLOAD_PROGRESS_EVENT,
             UploadProgress {
                 platform: platform.clone(),
                 sent,
                 total,
+                kind: kind.to_string(),
             },
         );
     }

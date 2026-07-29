@@ -25,6 +25,11 @@ export interface UploadProgress {
   platform: string;
   sent: number;
   total: number;
+  /**
+   * `reading` — loading the mix from disk into memory (determinate %).
+   * `sending` — HTTP multipart request in flight (no mid-body byte ticks).
+   */
+  kind: "reading" | "sending" | string;
 }
 
 /** A transient failure triggered an automatic retry (Rust `UploadRetry`). */

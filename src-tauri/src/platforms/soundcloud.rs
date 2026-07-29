@@ -344,7 +344,8 @@ impl SoundcloudClient {
         image_path: Option<&Path>,
         tags: Option<Vec<String>>,
         cancel: Arc<AtomicBool>,
-        progress: impl Fn(u64, u64) + Send + Clone + 'static,
+        // `(sent, total, kind)` — kind is "reading" (disk→RAM) or "sending" (HTTP).
+        progress: impl Fn(u64, u64, &str) + Send + Clone + 'static,
         on_retry: impl FnMut(u32, u32, u64, &str),
     ) -> Result<UploadResponse> {
         // Pre-flight — fail fast, before auth or reading the file into memory.
@@ -416,11 +417,19 @@ impl SoundcloudClient {
                 return Err(super::AttemptError::Cancelled);
             }
 
-            let file_part = super::audio_part_buffered(
-                file_path,
+            // Progress bar tracks disk reads into RAM (not the HTTP body stream —
+            // streaming multipart parts is what broke uploads for some users).
+            let on_read = {
+                let progress = progress.clone();
+                move |sent, total| progress(sent, total, "reading")
+            };
+            let file_bytes = super::read_audio_buffered(file_path, &cancel, on_read)?;
+            let audio_len = file_bytes.len() as u64;
+
+            let file_part = super::audio_part_from_bytes(
+                file_bytes,
                 file_name.clone(),
                 super::audio_mime(file_path),
-                &progress,
             )
             .map_err(super::AttemptError::Permanent)?;
 
@@ -442,6 +451,10 @@ impl SoundcloudClient {
                 form = form.text("track[tag_list]", tags_string.clone());
             }
             form = form.text("track[sharing]", "public");
+
+            // Switch the UI to an indeterminate "sending" phase — `Part::bytes`
+            // has no mid-body byte callback.
+            progress(0, audio_len, "sending");
 
             debug!("Sending upload request...");
             let started = std::time::Instant::now();
@@ -497,9 +510,7 @@ impl SoundcloudClient {
                     anyhow::Error::new(e).context("Failed to parse upload response"),
                 )
             })?;
-            // `Part::bytes` has no mid-body progress; snap the bar to 100% on success.
-            let audio_len = file_path.metadata().map(|m| m.len()).unwrap_or(0);
-            progress(audio_len, audio_len);
+            progress(audio_len, audio_len, "sending");
             Ok(parsed)
         };
 
