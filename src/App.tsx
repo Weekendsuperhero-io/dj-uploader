@@ -113,10 +113,13 @@ export default function App() {
   const [scheduleDate, setScheduleDate] = useState("");
   const [scheduleTime, setScheduleTime] = useState("");
   const [generatePreviews, setGeneratePreviews] = useState(false);
-  // Persisted: once a user finds this fixes their uploads, it should stick.
-  const [forceHttp1, setForceHttp1] = useState<boolean>(
-    () => localStorage.getItem("forceHttp1") === "true",
-  );
+  // Default ON: large multipart POSTs over HTTP/2 have failed for real users.
+  // Persisted once toggled so a user who needs HTTP/2 can turn it off.
+  const [forceHttp1, setForceHttp1] = useState<boolean>(() => {
+    const stored = localStorage.getItem("forceHttp1");
+    if (stored === null) return true;
+    return stored === "true";
+  });
 
   const [auth, setAuth] = useState<AuthStatus | null>(null);
   const [connecting, setConnecting] = useState<Platform | null>(null);

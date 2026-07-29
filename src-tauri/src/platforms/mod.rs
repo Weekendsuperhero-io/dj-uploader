@@ -4,15 +4,76 @@ pub mod soundcloud;
 use anyhow::{Context, Result, bail};
 use log::debug;
 use reqwest::StatusCode;
-use reqwest::blocking::multipart;
+use reqwest::blocking::{Client, multipart};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::cli::Platform;
 use crate::config::TokenStorage;
+
+/// Build the HTTP client used for large multipart uploads.
+///
+/// The pre-Tauri app (v2026.6.1) that worked for end users was simply:
+/// ```ignore
+/// Client::builder().timeout(Duration::from_secs(300)).build()
+/// ```
+/// That inherited reqwest 0.13 defaults (HTTP/2 allowed, SO_KEEPALIVE 15s) and
+/// only added a **5-minute overall request timeout**.
+///
+/// Divergences that bit us later:
+/// - Streaming `Part::reader_with_length` (since fixed → `Part::bytes`)
+/// - Overriding `tcp_keepalive` / `connect_timeout` without matching the old
+///   builder (home routers sometimes mishandle non-default keepalive)
+/// - Leaving HTTP/2 on for multi-hundred-MB multipart POSTs
+///
+/// This helper stays close to the old builder: no keepalive/connect overrides,
+/// no overall timeout (so slow uplinks can finish; 300s was too short for large
+/// mixes), and HTTP/1.1 when `force_http1` is set.
+pub(crate) fn build_upload_client(force_http1: bool) -> Result<Client> {
+    let mut builder = Client::builder();
+    // Match the old app: do not set connect_timeout / tcp_keepalive — leave
+    // reqwest's crate defaults alone. Only pin the protocol when asked.
+    if force_http1 {
+        builder = builder.http1_only();
+    }
+    // No `.timeout(...)`: a multi-GB mix on a slow home uplink legitimately
+    // takes longer than the old 300s cap. Dead connections still fail via TCP.
+    //
+    // Bound only the initial connect so a black-holed DNS/route fails fast.
+    builder = builder.connect_timeout(Duration::from_secs(60));
+    builder.build().context("Failed to create HTTP client")
+}
+
+/// Enrich a reqwest transport error for the toast / CLI — timeout vs connect
+/// vs body is otherwise buried in a nested cause chain.
+pub(crate) fn describe_transport_error(err: &reqwest::Error, elapsed_secs: f64) -> String {
+    let mut tags = Vec::new();
+    if err.is_timeout() {
+        tags.push("timeout");
+    }
+    if err.is_connect() {
+        tags.push("connect");
+    }
+    if err.is_request() {
+        tags.push("request");
+    }
+    if err.is_body() {
+        tags.push("body");
+    }
+    if err.is_decode() {
+        tags.push("decode");
+    }
+    let kind = if tags.is_empty() {
+        "transport".to_string()
+    } else {
+        tags.join("+")
+    };
+    format!("Upload {kind} failed after {elapsed_secs:.1}s: {err:#}")
+}
 
 /// A `Read` wrapper that reports cumulative bytes read to a callback, throttled
 /// so it fires at most ~once per 1% (and never more often than every 256 KiB) to

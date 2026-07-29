@@ -47,23 +47,9 @@ pub struct MixcloudClient {
 }
 
 impl MixcloudClient {
-    /// `force_http1` pins uploads to HTTP/1.1. A large streaming upload over
-    /// HTTP/2 can be cut off at a fixed byte offset (h2 flow-control stalls,
-    /// proxy body-window limits) — the "always fails at the same percentage"
-    /// symptom — so the UI exposes this as a compatibility toggle.
+    /// `force_http1` pins uploads to HTTP/1.1 (see [`super::build_upload_client`]).
     pub fn new(force_http1: bool) -> Result<Self> {
-        // No overall request timeout: a large mix on a slow uplink must not be
-        // cut off while it's still making progress. Instead, bound the initial
-        // connect and use TCP keepalive so a genuinely dead/stalled connection
-        // still errors out during a long upload.
-        let mut builder = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .tcp_keepalive(std::time::Duration::from_secs(60));
-        if force_http1 {
-            builder = builder.http1_only();
-        }
-        let client = builder.build().context("Failed to create HTTP client")?;
-
+        let client = super::build_upload_client(force_http1)?;
         let token_storage = TokenStorage::load()?;
 
         Ok(Self {
@@ -268,22 +254,28 @@ impl MixcloudClient {
             .context("Invalid file name")?
             .to_string();
 
-        // Prepare (and size-check) the cover art once. A bad image is a
-        // permanent error, so surface it here before the retry loop.
-        let artwork = if let Some(img_path) = image_path.filter(|p| p.exists()) {
-            let art = crate::artwork::prepare(img_path)?;
-            let picture_len = art.bytes.len() as u64;
-            if picture_len > super::MAX_MIXCLOUD_PICTURE_BYTES {
-                bail!(
-                    "Cover art is {} — exceeds Mixcloud's {} picture limit",
-                    super::human_bytes(picture_len),
-                    super::human_bytes(super::MAX_MIXCLOUD_PICTURE_BYTES)
-                );
-            }
-            Some(art)
-        } else {
-            None
-        };
+        // Cover art: match the pre-rewrite app — send the original bytes with
+        // only a file name (no MIME override, no resize/re-encode). The new
+        // `artwork::prepare` path is kept for SoundCloud (which requires square
+        // ≥800px); Mixcloud accepted raw pictures for years and re-encoding has
+        // been an unproven extra failure mode (HEIC, huge PNGs, etc.).
+        let artwork: Option<(Vec<u8>, String)> =
+            if let Some(img_path) = image_path.filter(|p| p.exists()) {
+                super::ensure_within_limit(
+                    img_path,
+                    super::MAX_MIXCLOUD_PICTURE_BYTES,
+                    "Cover art",
+                )?;
+                let bytes = std::fs::read(img_path).context("Failed to read image file")?;
+                let name = img_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("cover.jpg")
+                    .to_string();
+                Some((bytes, name))
+            } else {
+                None
+            };
 
         // One upload attempt: re-read the audio into memory, rebuild the
         // multipart form, send, and parse. Buffered `Part::bytes` matches the
@@ -315,11 +307,9 @@ impl MixcloudClient {
             if let Some(desc) = description {
                 form = form.text("description", desc.to_string());
             }
-            if let Some(art) = &artwork {
-                let img_part = multipart::Part::bytes(art.bytes.clone())
-                    .file_name(art.file_name.clone())
-                    .mime_str(art.mime)
-                    .map_err(|e| super::AttemptError::Permanent(anyhow::Error::new(e)))?;
+            if let Some((bytes, name)) = &artwork {
+                // Same shape as v2026.6.1: bytes + file_name only (no mime_str).
+                let img_part = multipart::Part::bytes(bytes.clone()).file_name(name.clone());
                 form = form.part("picture", img_part);
             }
             // Mixcloud expects tags-0-tag, tags-1-tag, etc.
@@ -352,14 +342,10 @@ impl MixcloudClient {
                     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                         return Err(super::AttemptError::Cancelled);
                     }
-                    // Note the elapsed time: a *constant* time-to-failure points at
-                    // a proxy duration timeout; a constant *byte offset* points at
-                    // an h2/body-size cutoff.
-                    return Err(super::AttemptError::Retryable(anyhow::Error::new(e).context(
-                        format!(
-                            "Upload connection failed after {:.1}s",
-                            started.elapsed().as_secs_f64()
-                        ),
+                    let elapsed = started.elapsed().as_secs_f64();
+                    return Err(super::AttemptError::Retryable(anyhow::anyhow!(
+                        "{}",
+                        super::describe_transport_error(&e, elapsed)
                     )));
                 }
             };
@@ -389,9 +375,19 @@ impl MixcloudClient {
 
             let parsed: UploadResponse = serde_json::from_str(&response_text).map_err(|e| {
                 super::AttemptError::Permanent(
-                    anyhow::Error::new(e).context("Failed to parse upload response"),
+                    anyhow::Error::new(e).context(format!(
+                        "Failed to parse upload response (body starts with: {})",
+                        response_text.chars().take(200).collect::<String>()
+                    )),
                 )
             })?;
+            // HTTP 200 with result.success=false is still a failed upload.
+            if !parsed.result.success {
+                return Err(super::AttemptError::Permanent(anyhow::anyhow!(
+                    "Mixcloud rejected the upload: {}",
+                    parsed.result.message
+                )));
+            }
             progress(audio_len, audio_len, "sending");
             Ok(parsed)
         };

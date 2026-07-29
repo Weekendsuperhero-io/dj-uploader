@@ -61,23 +61,9 @@ pub struct SoundcloudClient {
 }
 
 impl SoundcloudClient {
-    /// `force_http1` pins uploads to HTTP/1.1. A large streaming upload over
-    /// HTTP/2 can be cut off at a fixed byte offset (h2 flow-control stalls,
-    /// proxy body-window limits) — the "always fails at the same percentage"
-    /// symptom — so the UI exposes this as a compatibility toggle.
+    /// `force_http1` pins uploads to HTTP/1.1 (see [`super::build_upload_client`]).
     pub fn new(force_http1: bool) -> Result<Self> {
-        // No overall request timeout: a large mix on a slow uplink must not be
-        // cut off while it's still making progress. Instead, bound the initial
-        // connect and use TCP keepalive so a genuinely dead/stalled connection
-        // still errors out during a long upload.
-        let mut builder = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .tcp_keepalive(std::time::Duration::from_secs(60));
-        if force_http1 {
-            builder = builder.http1_only();
-        }
-        let client = builder.build().context("Failed to create HTTP client")?;
-
+        let client = super::build_upload_client(force_http1)?;
         let credentials = SoundcloudCredentials::new();
         let token_storage = TokenStorage::load()?;
 
@@ -471,14 +457,10 @@ impl SoundcloudClient {
                     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                         return Err(super::AttemptError::Cancelled);
                     }
-                    // Note the elapsed time: a *constant* time-to-failure points at
-                    // a proxy duration timeout; a constant *byte offset* points at
-                    // an h2/body-size cutoff.
-                    return Err(super::AttemptError::Retryable(anyhow::Error::new(e).context(
-                        format!(
-                            "Upload connection failed after {:.1}s",
-                            started.elapsed().as_secs_f64()
-                        ),
+                    let elapsed = started.elapsed().as_secs_f64();
+                    return Err(super::AttemptError::Retryable(anyhow::anyhow!(
+                        "{}",
+                        super::describe_transport_error(&e, elapsed)
                     )));
                 }
             };
