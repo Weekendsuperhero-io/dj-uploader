@@ -178,8 +178,9 @@ pub async fn upload(
         .map_err(|e| e.to_string())?
 }
 
-/// Signal the in-flight upload to stop. The `ProgressReader` polls this flag and
-/// aborts the current request; the retry loop then stops instead of retrying.
+/// Signal the in-flight upload to stop. Checked between attempts (and before
+/// rebuilding the form); the retry loop stops instead of starting another try.
+/// Mid-body cancel of a buffered `Part::bytes` send is not possible.
 #[tauri::command]
 pub async fn cancel_upload(cancel: State<'_, UploadCancel>) -> Result<(), String> {
     cancel.0.store(true, Ordering::Relaxed);

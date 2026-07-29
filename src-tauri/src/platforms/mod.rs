@@ -4,63 +4,13 @@ pub mod soundcloud;
 use anyhow::{Context, Result, bail};
 use log::debug;
 use reqwest::StatusCode;
-use std::io::Read;
+use reqwest::blocking::multipart;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cli::Platform;
 use crate::config::TokenStorage;
-
-/// A `Read` wrapper that reports cumulative bytes read to a callback, throttled
-/// so it fires at most ~once per 1% (and never more often than every 256 KiB) to
-/// avoid flooding the IPC event channel. Used to drive the upload progress bar.
-///
-/// It also polls a shared `cancel` flag on every `read`, returning an error when
-/// set. Because reqwest pulls the request body through this reader, that error
-/// aborts the in-flight blocking `.send()` — the cleanest way to interrupt an
-/// upload the user asked to cancel.
-pub(crate) struct ProgressReader<R, F> {
-    inner: R,
-    total: u64,
-    read: u64,
-    last_emitted: u64,
-    step: u64,
-    cancel: Arc<AtomicBool>,
-    callback: F,
-}
-
-impl<R: Read, F: Fn(u64, u64)> ProgressReader<R, F> {
-    pub(crate) fn new(inner: R, total: u64, cancel: Arc<AtomicBool>, callback: F) -> Self {
-        let step = (total / 100).max(256 * 1024);
-        Self {
-            inner,
-            total,
-            read: 0,
-            last_emitted: 0,
-            step,
-            cancel,
-            callback,
-        }
-    }
-}
-
-impl<R: Read, F: Fn(u64, u64)> Read for ProgressReader<R, F> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.cancel.load(Ordering::Relaxed) {
-            return Err(std::io::Error::other("upload cancelled"));
-        }
-        let n = self.inner.read(buf)?;
-        if n > 0 {
-            self.read += n as u64;
-            if self.read - self.last_emitted >= self.step || self.read >= self.total {
-                self.last_emitted = self.read;
-                (self.callback)(self.read, self.total);
-            }
-        }
-        Ok(n)
-    }
-}
 
 /// Number of upload attempts before giving up (1 initial + 5 retries).
 pub(crate) const MAX_UPLOAD_ATTEMPTS: u32 = 6;
@@ -240,6 +190,32 @@ pub(crate) fn audio_mime(path: &Path) -> &'static str {
         Some("ogg") => "audio/ogg",
         _ => "application/octet-stream",
     }
+}
+
+/// Build an audio multipart part the way the pre-rewrite app did: load the whole
+/// file into memory and attach it with [`multipart::Part::bytes`].
+///
+/// Streaming via `Part::reader_with_length` (even with a known length, and even
+/// pinned to HTTP/1.1) failed for some users on large mixes — connection drops
+/// mid-body that the old buffered path never hit. Buffering uses more RAM but
+/// is the proven-reliable path for Mixcloud/SoundCloud.
+///
+/// `progress` is invoked once after the file is loaded (`0, len`) and again
+/// after a successful response path should call `progress(len, len)`. Mid-body
+/// byte progress is not available with `Part::bytes`.
+pub(crate) fn audio_part_buffered(
+    file_path: &Path,
+    file_name: String,
+    mime: &str,
+    progress: &impl Fn(u64, u64),
+) -> Result<multipart::Part> {
+    let file_bytes = std::fs::read(file_path).context("Failed to read audio file")?;
+    let len = file_bytes.len() as u64;
+    progress(0, len);
+    multipart::Part::bytes(file_bytes)
+        .file_name(file_name)
+        .mime_str(mime)
+        .context("Failed to build audio multipart part")
 }
 
 pub fn handle_auth(platform: Platform) -> Result<()> {

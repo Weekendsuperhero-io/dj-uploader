@@ -6,7 +6,6 @@ use reqwest::blocking::{Client, multipart};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::Path;
@@ -382,13 +381,6 @@ impl SoundcloudClient {
             .context("Invalid file name")?
             .to_string();
 
-        // Stream large DJ mixes directly from disk instead of allocating the
-        // entire file in memory before the request starts.
-        let audio_len = file_path
-            .metadata()
-            .context("Failed to read audio file metadata")?
-            .len();
-
         // Prepare the cover art once. A bad image is a permanent error, so
         // surface it here before the retry loop.
         let artwork = match image_path.filter(|p| p.exists()) {
@@ -413,26 +405,24 @@ impl SoundcloudClient {
                 .join(" ")
         });
 
-        // One upload attempt: reopen the file, rebuild the multipart form (the
-        // streaming `ProgressReader` is single-use), send, and parse. Wrapped in
-        // `send_with_retry` so a dropped connection retries with backoff instead
-        // of failing outright.
+        // One upload attempt: re-read the audio into memory, rebuild the
+        // multipart form, send, and parse. Buffered `Part::bytes` matches the
+        // pre-rewrite app that worked for large mixes; streaming
+        // `reader_with_length` failed for some users even with HTTP/1.1.
+        // Wrapped in `send_with_retry` so a dropped connection retries with
+        // backoff instead of failing outright.
         let send_once = || -> Result<UploadResponse, super::AttemptError> {
-            let audio_file = File::open(file_path).map_err(|e| {
-                super::AttemptError::Permanent(
-                    anyhow::Error::new(e).context("Failed to open audio file"),
-                )
-            })?;
-            let reader = super::ProgressReader::new(
-                audio_file,
-                audio_len,
-                cancel.clone(),
-                progress.clone(),
-            );
-            let file_part = multipart::Part::reader_with_length(reader, audio_len)
-                .file_name(file_name.clone())
-                .mime_str(super::audio_mime(file_path))
-                .map_err(|e| super::AttemptError::Permanent(anyhow::Error::new(e)))?;
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(super::AttemptError::Cancelled);
+            }
+
+            let file_part = super::audio_part_buffered(
+                file_path,
+                file_name.clone(),
+                super::audio_mime(file_path),
+                &progress,
+            )
+            .map_err(super::AttemptError::Permanent)?;
 
             let mut form = multipart::Form::new().part("track[asset_data]", file_part);
             form = form.text("track[title]", title.to_string());
@@ -502,11 +492,15 @@ impl SoundcloudClient {
             println!("{response_text}");
             println!();
 
-            serde_json::from_str(&response_text).map_err(|e| {
+            let parsed: UploadResponse = serde_json::from_str(&response_text).map_err(|e| {
                 super::AttemptError::Permanent(
                     anyhow::Error::new(e).context("Failed to parse upload response"),
                 )
-            })
+            })?;
+            // `Part::bytes` has no mid-body progress; snap the bar to 100% on success.
+            let audio_len = file_path.metadata().map(|m| m.len()).unwrap_or(0);
+            progress(audio_len, audio_len);
+            Ok(parsed)
         };
 
         let upload_response = super::send_with_retry(&cancel, on_retry, send_once)?;
